@@ -161,7 +161,7 @@ class PromptDepthAnythingFeatureFusionLayer(nn.Module):
 
 
 class PromptDepthAnythingFeatureFusionStage(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: PromptDepthAnythingConfig):
         super().__init__()
         self.layers = nn.ModuleList()
         for _ in range(len(config.neck_hidden_sizes)):
@@ -243,14 +243,8 @@ class PromptDepthAnythingPreTrainedModel(PreTrainedModel):
     config: PromptDepthAnythingConfig
     base_model_prefix = "prompt_depth_anything"
     main_input_name = "pixel_values"
+    input_modalities = ("image",)
     supports_gradient_checkpointing = True
-
-    def _init_weights(self, module):
-        """Initialize the weights"""
-        if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
 
 
 class PromptDepthAnythingReassembleLayer(nn.Module):
@@ -399,6 +393,7 @@ class PromptDepthAnythingForDepthEstimation(PromptDepthAnythingPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[tuple[torch.Tensor], DepthEstimatorOutput]:
         r"""
         prompt_depth (`torch.FloatTensor` of shape `(batch_size, 1, height, width)`, *optional*):

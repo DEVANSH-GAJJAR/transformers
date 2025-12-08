@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-from ...configuration_utils import PretrainedConfig
+from ...configuration_utils import PreTrainedConfig
 from ...utils import (
     logging,
 )
@@ -24,15 +24,15 @@ from ..auto import CONFIG_MAPPING, AutoConfig
 logger = logging.get_logger(__name__)
 
 
-class LlavaOnevisionConfig(PretrainedConfig):
+class LlavaOnevisionConfig(PreTrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`LlavaOnevisionForConditionalGeneration`]. It is used to instantiate an
     Llava-NeXT model according to the specified arguments, defining the model architecture. Instantiating a configuration
     with the defaults will yield a similar configuration to that of the [llava-hf/llava-onevision-qwen2-7b-ov-hf](https://huggingface.co/llava-hf/llava-onevision-qwen2-7b-ov-hf)
     model.
 
-    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PretrainedConfig`] for more information.
+    Configuration objects inherit from [`PreTrainedConfig`] and can be used to control the model outputs. Read the
+    documentation from [`PreTrainedConfig`] for more information.
 
     Args:
         vision_config (`Union[AutoConfig, dict]`,  *optional*, defaults to `SiglipVisionConfig`):
@@ -58,8 +58,6 @@ class LlavaOnevisionConfig(PretrainedConfig):
         image_grid_pinpoints (`List`, *optional*):
             A list of possible resolutions to use for processing high resolution images. Each item in the list should be a tuple or list
             of the form `(height, width)`.
-        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
-            Whether the model's input and output word embeddings should be tied.
         multimodal_projector_bias (`bool`, *optional*, defaults to `True`):
             Whether to use bias in the multimodal projector.
 
@@ -102,7 +100,6 @@ class LlavaOnevisionConfig(PretrainedConfig):
         vision_feature_layer=-1,
         vision_aspect_ratio="anyres_max_9",
         image_grid_pinpoints=None,
-        tie_word_embeddings=False,
         multimodal_projector_bias=True,
         **kwargs,
     ):
@@ -165,9 +162,7 @@ class LlavaOnevisionConfig(PretrainedConfig):
         self.image_grid_pinpoints = image_grid_pinpoints
 
         if isinstance(vision_config, dict):
-            vision_config["model_type"] = (
-                vision_config["model_type"] if "model_type" in vision_config else "siglip_vision_model"
-            )
+            vision_config["model_type"] = vision_config.get("model_type", "siglip_vision_model")
             vision_config = CONFIG_MAPPING[vision_config["model_type"]](**vision_config)
         elif vision_config is None:
             vision_config = CONFIG_MAPPING["siglip_vision_model"](
@@ -183,14 +178,20 @@ class LlavaOnevisionConfig(PretrainedConfig):
         self.vision_config = vision_config
 
         if isinstance(text_config, dict):
-            text_config["model_type"] = text_config["model_type"] if "model_type" in text_config else "qwen2"
+            text_config["model_type"] = text_config.get("model_type", "qwen2")
             text_config = CONFIG_MAPPING[text_config["model_type"]](**text_config)
         elif text_config is None:
             text_config = CONFIG_MAPPING["qwen2"]()
 
         self.text_config = text_config
 
-        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+        super().__init__(**kwargs)
+
+        # Due to a mismatch at model addition-time, the `tie_word_embeddings` was saved in the text config, even
+        # though it concerns the main model, while it was set to False by default in the main model... So we hardcode a fix here
+        if not self.tie_word_embeddings and self.text_config.tie_word_embeddings:
+            self.tie_word_embeddings = True
+            self.text_config.tie_word_embeddings = False
 
 
 __all__ = ["LlavaOnevisionConfig"]

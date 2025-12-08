@@ -136,7 +136,7 @@ def convert_dit_checkpoint(checkpoint_url, pytorch_dump_folder_path, push_to_hub
     """
 
     # define default BEiT configuration
-    has_lm_head = False if "rvlcdip" in checkpoint_url else True
+    has_lm_head = "rvlcdip" not in checkpoint_url
     config = BeitConfig(use_absolute_position_embeddings=True, use_mask_token=has_lm_head)
 
     # size of the architecture
@@ -196,18 +196,8 @@ def convert_dit_checkpoint(checkpoint_url, pytorch_dump_folder_path, push_to_hub
             model_name = "dit-base" if "base" in checkpoint_url else "dit-large"
         else:
             model_name = "dit-base-finetuned-rvlcdip" if "dit-b" in checkpoint_url else "dit-large-finetuned-rvlcdip"
-        image_processor.push_to_hub(
-            repo_path_or_name=Path(pytorch_dump_folder_path, model_name),
-            organization="nielsr",
-            commit_message="Add image processor",
-            use_temp_dir=True,
-        )
-        model.push_to_hub(
-            repo_path_or_name=Path(pytorch_dump_folder_path, model_name),
-            organization="nielsr",
-            commit_message="Add model",
-            use_temp_dir=True,
-        )
+        image_processor.push_to_hub(repo_id=f"nielsr/{model_name}")
+        model.push_to_hub(repo_id=f"nielsr/{model_name}")
 
 
 if __name__ == "__main__":

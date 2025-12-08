@@ -17,6 +17,7 @@
 import tempfile
 import unittest
 
+import pytest
 import requests
 
 from transformers import (
@@ -27,7 +28,7 @@ from transformers import (
     SamHQVisionModel,
     pipeline,
 )
-from transformers.testing_utils import Expectations, cleanup, require_torch, require_torch_sdpa, slow, torch_device
+from transformers.testing_utils import Expectations, cleanup, require_torch, slow, torch_device
 from transformers.utils import is_torch_available, is_vision_available
 
 from ...test_configuration_common import ConfigTester
@@ -165,11 +166,8 @@ class SamHQVisionModelTest(ModelTesterMixin, unittest.TestCase):
     """
 
     all_model_classes = (SamHQVisionModel,) if is_torch_available() else ()
-    fx_compatible = False
-    test_pruning = False
+
     test_resize_embeddings = False
-    test_head_masking = False
-    test_torchscript = False
     test_torch_exportable = True
 
     def setUp(self):
@@ -264,7 +262,7 @@ class SamHQVisionModelTest(ModelTesterMixin, unittest.TestCase):
     def test_hidden_states_output(self):
         pass
 
-    @require_torch_sdpa
+    @pytest.mark.torch_compile_test
     def test_sdpa_can_compile_dynamic(self):
         self.skipTest(reason="SAM model can't be compiled dynamic yet")
 
@@ -545,11 +543,8 @@ class SamHQModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     pipeline_model_mapping = (
         {"feature-extraction": SamHQModel, "mask-generation": SamHQModel} if is_torch_available() else {}
     )
-    fx_compatible = False
-    test_pruning = False
+
     test_resize_embeddings = False
-    test_head_masking = False
-    test_torchscript = False
     test_cpu_offload = False
     test_disk_offload_bin = False
     test_disk_offload_safetensors = False
@@ -705,16 +700,15 @@ class SamHQModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
         model = SamHQModel.from_pretrained(model_name)
         self.assertIsNotNone(model)
 
-    @require_torch_sdpa
+    @pytest.mark.torch_compile_test
     def test_sdpa_can_compile_dynamic(self):
         self.skipTest(reason="SamHQModel can't be compiled dynamic yet")
 
-    @require_torch_sdpa
     def test_sdpa_can_dispatch_composite_models(self):
         """
         Tests if composite models dispatch correctly on SDPA/eager when requested so when loading the model.
         This tests only by looking at layer names, as usually SDPA layers are calles "SDPAAttention".
-        In contrast to the above test, this one checks if the "config._attn_implamentation" is a dict after the model
+        In contrast to the above test, this one checks if the "config._attn_implementation" is a dict after the model
         is loaded, because we manually replicate requested attn implementation on each sub-config when loading.
         See https://github.com/huggingface/transformers/pull/32238 for more info
 
@@ -806,7 +800,8 @@ class SamHQModelIntegrationTest(unittest.TestCase):
         expectations = Expectations(
             {
                 (None, None): [-13.1695, -14.6201, -14.8989],
-                ("cuda", 8): [-13.1668, -14.6182, -14.8970],
+                ("cuda", 8): [-7.6769, -9.6935, -9.8773],
+                ("xpu", None): [-7.6769, -9.6935, -9.8773],
             }
         )
         EXPECTED_MASKS = torch.tensor(expectations.get_expectation()).to(torch_device)
@@ -831,9 +826,9 @@ class SamHQModelIntegrationTest(unittest.TestCase):
             outputs = model(**inputs)
         scores = outputs.iou_scores.squeeze()
         masks = outputs.pred_masks[0, 0, 0, 0, :3]
-        self.assertTrue(torch.allclose(scores[-1], torch.tensor(0.9700), atol=2e-4))
-        self.assertTrue(
-            torch.allclose(masks, torch.tensor([-29.9144, -30.0546, -30.9526]).to(torch_device), atol=3e-2)
+        torch.testing.assert_close(scores[-1], torch.tensor(0.9700).to(torch_device), atol=2e-4, rtol=2e-4)
+        torch.testing.assert_close(
+            masks, torch.tensor([-9.2033, -8.5505, -7.1361]).to(torch_device), atol=3e-2, rtol=3e-2
         )
 
     def test_inference_mask_generation_batched_points_batched_images(self):
@@ -895,7 +890,7 @@ class SamHQModelIntegrationTest(unittest.TestCase):
         expectations = Expectations(
             {
                 (None, None): [-40.2445, -37.4300, -38.1577],
-                ("cuda", 8): [-40.2351, -37.4334, -38.1526],
+                ("cuda", 8): [-14.1195, -17.2663, -13.7805],
             }
         )
         EXPECTED_MASKS = torch.tensor(expectations.get_expectation()).to(torch_device)

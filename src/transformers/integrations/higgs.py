@@ -46,7 +46,7 @@ def pad_to_block(tensor, dims, had_block_size, value=0):
     return nn.functional.pad(tensor, pad_dims, "constant", value)
 
 
-def get_higgs_grid(p: int, n: int):
+def get_higgs_grid(p: int, n: int) -> "torch.Tensor":
     if (p, n) == (2, 256):
         return torch.tensor(
             [
@@ -496,8 +496,8 @@ class HiggsLinear(torch.nn.Module):
         out_features: int,
         num_bits: int,
         bias=True,
-        dtype: torch.dtype = None,
-        device: torch.device = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
         group_size: int = 256,
         hadamard_size: int = 1024,
     ):
@@ -554,6 +554,7 @@ def replace_with_higgs_linear(
     quantization_config=None,
     current_key_name=None,
     has_been_replaced=False,
+    modules_to_not_convert=None,
 ):
     """
     Public method that recursively replaces the Linear layers of the given model with HIGGS quantized layers.
@@ -582,7 +583,7 @@ def replace_with_higgs_linear(
         if isinstance(module, nn.Linear):
             # Check if the current key is not in the `quantization_config.modules_to_not_convert`
             current_key_name_str = ".".join(current_key_name)
-            if not any(current_key_name_str.endswith(key) for key in quantization_config.modules_to_not_convert):
+            if not any(current_key_name_str.endswith(key) for key in modules_to_not_convert):
                 with init_empty_weights():
                     in_features = module.in_features
                     out_features = module.out_features
@@ -607,6 +608,7 @@ def replace_with_higgs_linear(
                 quantization_config=quantization_config,
                 current_key_name=current_key_name,
                 has_been_replaced=has_been_replaced,
+                modules_to_not_convert=modules_to_not_convert,
             )
         # Remove the last key for recursion
         current_key_name.pop(-1)

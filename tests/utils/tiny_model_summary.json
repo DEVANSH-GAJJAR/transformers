@@ -626,7 +626,7 @@
         "model_classes": [
             "Blip2ForConditionalGeneration"
         ],
-        "sha": "35e1ef43da3554af62eb29a7b3dbbef3f3bef48e"
+        "sha": "d0de11fd1f8ca481231c07ee0934924be96cb281"
     },
     "Blip2Model": {
         "tokenizer_classes": [
@@ -4999,6 +4999,17 @@
             "PvtModel"
         ],
         "sha": "c40765c382515ae627652d60e9077b6478448d48"
+    },
+    "Qwen2_5OmniForConditionalGeneration": {
+        "tokenizer_classes": [
+            "Qwen2Tokenizer",
+            "Qwen2TokenizerFast"
+        ],
+        "processor_classes": ["Qwen2_5OmniProcessor"],
+        "model_classes": [
+            "Qwen2_5OmniForConditionalGeneration"
+        ],
+        "sha": "9bc7a812cc447b430acb994f8d42e8e64c7b61f6"
     },
     "ReformerForMaskedLM": {
         "tokenizer_classes": [

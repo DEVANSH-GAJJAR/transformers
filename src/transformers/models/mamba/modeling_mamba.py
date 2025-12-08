@@ -19,13 +19,14 @@ from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
 
+from ... import initialization as init
 from ...activations import ACT2FN
-from ...cache_utils import MambaCache
+from ...configuration_utils import PreTrainedConfig
 from ...generation import GenerationMixin
+from ...integrations.hub_kernels import lazy_load_kernel
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_utils import PreTrainedModel
 from ...utils import (
@@ -33,7 +34,7 @@ from ...utils import (
     auto_docstring,
     logging,
 )
-from ...utils.import_utils import is_causal_conv1d_available, is_mamba_ssm_available, is_mambapy_available
+from ...utils.import_utils import is_mamba_ssm_available, is_mambapy_available, is_torchdynamo_compiling
 from .configuration_mamba import MambaConfig
 
 
@@ -50,14 +51,108 @@ if is_mamba_ssm_available():
 else:
     selective_state_update, selective_scan_fn, mamba_inner_fn = None, None, None
 
-if is_causal_conv1d_available():
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-else:
-    causal_conv1d_update, causal_conv1d_fn = None, None
 
-is_fast_path_available = all(
-    (selective_state_update, selective_scan_fn, causal_conv1d_fn, causal_conv1d_update, mamba_inner_fn)
-)
+class MambaCache:
+    """
+    Cache for mamba model which does not have attention mechanism and key value states.
+
+    Arguments:
+        config (`PreTrainedConfig):
+            The configuration file defining the shape-related attributes required to initialize the static cache.
+        max_batch_size (`int`):
+            The maximum batch size with which the model will be used. Note that a new instance must be instantiated if
+            a smaller batch size is used.
+        dtype (`torch.dtype`, *optional*, defaults to `torch.float16`):
+            The default `dtype` to use when initializing the layer.
+        device (`torch.device` or `str`, *optional*):
+            The device on which the cache should be initialized. Should be the same as the layer.
+
+    Example:
+
+        ```python
+        >>> import torch
+        >>> from transformers import AutoTokenizer, MambaForCausalLM, MambaCache
+
+        >>> model = MambaForCausalLM.from_pretrained("state-spaces/mamba-130m-hf")
+        >>> tokenizer = AutoTokenizer.from_pretrained("state-spaces/mamba-130m-hf")
+
+        >>> inputs = tokenizer(text="My name is Mamba", return_tensors="pt")
+
+        >>> # Prepare a cache class and pass it to model's forward
+        >>> cache_params = MambaCache(config=model.config, max_batch_size=1, device=model.device, dtype=model.dtype)
+        >>> cache_position = torch.arange(len(inputs["input_ids"][0]), device=model.device)  # sequence length
+        >>> outputs = model(**inputs, cache_params=cache_params, cache_position=cache_position, use_cache=True)
+        >>> outputs.cache_params
+        ```
+    """
+
+    is_compileable = True
+
+    # TODO (joao): add layer_device_map arg and update code in `generate` accordingly
+    def __init__(
+        self,
+        config: PreTrainedConfig,
+        max_batch_size: int,
+        dtype: torch.dtype = torch.float16,
+        device: Union[torch.device, str, None] = None,
+    ):
+        self.max_batch_size = max_batch_size
+        self._dtype = dtype
+        self.intermediate_size = config.intermediate_size
+        self.ssm_state_size = config.state_size
+        self.conv_kernel_size = config.conv_kernel
+
+        self.conv_states: list[torch.Tensor] = []
+        self.ssm_states: list[torch.Tensor] = []
+        device = torch.device(device) if device is not None else None
+        for _ in range(config.num_hidden_layers):
+            conv_state: torch.Tensor = torch.zeros(
+                self.max_batch_size,
+                self.intermediate_size,
+                self.conv_kernel_size,
+                device=device,
+                dtype=self._dtype,
+            )
+            ssm_state: torch.Tensor = torch.zeros(
+                self.max_batch_size,
+                self.intermediate_size,
+                self.ssm_state_size,
+                device=device,
+                dtype=self._dtype,
+            )
+
+            torch._dynamo.mark_static_address(conv_state)
+            torch._dynamo.mark_static_address(ssm_state)
+            self.conv_states.append(conv_state)
+            self.ssm_states.append(ssm_state)
+
+    def update_conv_state(
+        self, layer_idx: int, new_conv_state: torch.Tensor, cache_position: torch.LongTensor
+    ) -> torch.Tensor:
+        # This `if` blocks is only reached in multigpu and if `layer_device_map` is not passed. It is used
+        # when the cache is initialized in the forward pass (e.g. Mamba)
+        if self.conv_states[layer_idx].device != new_conv_state.device:
+            self.conv_states[layer_idx] = self.conv_states[layer_idx].to(new_conv_state.device)
+
+        conv_state = self.conv_states[layer_idx]
+        cache_position = cache_position.clamp(0, self.conv_kernel_size - 1)
+
+        conv_state = conv_state.roll(shifts=-1, dims=-1)
+        conv_state[:, :, cache_position] = new_conv_state.to(device=conv_state.device, dtype=conv_state.dtype)
+        self.conv_states[layer_idx].zero_()
+        self.conv_states[layer_idx] += conv_state
+        return self.conv_states[layer_idx]
+
+    def update_ssm_state(self, layer_idx: int, new_ssm_state: torch.Tensor):
+        self.ssm_states[layer_idx].zero_()
+        self.ssm_states[layer_idx] += new_ssm_state.to(self.ssm_states[layer_idx].device)
+        return self.ssm_states[layer_idx]
+
+    def reset(self):
+        for layer_idx in range(len(self.conv_states)):
+            # In-place ops prevent breaking the static address
+            self.conv_states[layer_idx].zero_()
+            self.ssm_states[layer_idx].zero_()
 
 
 class MambaMixer(nn.Module):
@@ -109,13 +204,25 @@ class MambaMixer(nn.Module):
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
         self.use_bias = config.use_bias
 
+        self.warn_slow_implementation()
+
+    def warn_slow_implementation(self):
+        causal_conv1d = lazy_load_kernel("causal-conv1d")
+        causal_conv1d_update, causal_conv1d_fn = (
+            (causal_conv1d.causal_conv1d_update, causal_conv1d.causal_conv1d_fn)
+            if causal_conv1d is not None
+            else (None, None)
+        )
+        is_fast_path_available = all(
+            (selective_state_update, selective_scan_fn, causal_conv1d_fn, causal_conv1d_update, mamba_inner_fn)
+        )
         if not is_fast_path_available:
             if self.use_mambapy:
                 if is_mambapy_available():
                     logger.warning_once(
                         "The fast path is not available because one of `(selective_state_update, selective_scan_fn, causal_conv1d_fn, causal_conv1d_update, mamba_inner_fn)`"
-                        " is None. Falling back to the mamba.py backend. To install follow https://github.com/state-spaces/mamba/#installation and"
-                        " https://github.com/Dao-AILab/causal-conv1d"
+                        " is None. Falling back to the mamba.py backend. To install follow https://github.com/state-spaces/mamba/#installation for mamba-ssm and"
+                        " install the kernels library using `pip install kernels` or https://github.com/Dao-AILab/causal-conv1d for causal-conv1d"
                     )
                 else:
                     raise ImportError(
@@ -124,8 +231,8 @@ class MambaMixer(nn.Module):
             else:
                 logger.warning_once(
                     "The fast path is not available because one of `(selective_state_update, selective_scan_fn, causal_conv1d_fn, causal_conv1d_update, mamba_inner_fn)`"
-                    " is None. Falling back to the sequential implementation of Mamba, as use_mambapy is set to False. To install follow https://github.com/state-spaces/mamba/#installation and"
-                    " https://github.com/Dao-AILab/causal-conv1d. For the mamba.py backend, follow https://github.com/alxndrTL/mamba.py."
+                    " is None. Falling back to the sequential implementation of Mamba, as use_mambapy is set to False. To install follow https://github.com/state-spaces/mamba/#installation for mamba-ssm and"
+                    " install the kernels library using `pip install kernels` or https://github.com/Dao-AILab/causal-conv1d for causal-conv1d. For the mamba.py backend, follow https://github.com/alxndrTL/mamba.py."
                 )
 
     def cuda_kernels_forward(
@@ -156,6 +263,12 @@ class MambaMixer(nn.Module):
             )
 
         else:
+            causal_conv1d = lazy_load_kernel("causal-conv1d")
+            causal_conv1d_update, causal_conv1d_fn = (
+                (causal_conv1d.causal_conv1d_update, causal_conv1d.causal_conv1d_fn)
+                if causal_conv1d is not None
+                else (None, None)
+            )
             hidden_states, gate = projected_states.chunk(2, dim=1)
 
             if attention_mask is not None:
@@ -319,7 +432,16 @@ class MambaMixer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.LongTensor] = None,
     ):
-        if is_fast_path_available and "cuda" in self.x_proj.weight.device.type and not torch._dynamo.is_compiling():
+        causal_conv1d = lazy_load_kernel("causal-conv1d")
+        causal_conv1d_update, causal_conv1d_fn = (
+            (causal_conv1d.causal_conv1d_update, causal_conv1d.causal_conv1d_fn)
+            if causal_conv1d is not None
+            else (None, None)
+        )
+        is_fast_path_available = all(
+            (selective_state_update, selective_scan_fn, causal_conv1d_fn, causal_conv1d_update, mamba_inner_fn)
+        )
+        if is_fast_path_available and "cuda" in self.x_proj.weight.device.type and not is_torchdynamo_compiling():
             return self.cuda_kernels_forward(hidden_states, cache_params, cache_position, attention_mask)
         return self.slow_forward(hidden_states, cache_params, cache_position, attention_mask)
 
@@ -380,6 +502,7 @@ class MambaPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _is_stateful = True
 
+    @torch.no_grad()
     def _init_weights(self, module):
         """Initialize the weights."""
         std = self.config.initializer_range
@@ -388,16 +511,14 @@ class MambaPreTrainedModel(PreTrainedModel):
             # The core is to load them, compute the discrete states, then write the updated state. Keeps the memory bounded
             A = torch.arange(1, module.ssm_state_size + 1, dtype=torch.float32)[None, :]
             A = A.expand(module.intermediate_size, -1).contiguous()
-            module.A_log.copy_(torch.log(A))
-            module.A_log._no_weight_decay = True
-            module.D._no_weight_decay = True
-            module.D.data.fill_(1.0)
+            init.copy_(module.A_log, torch.log(A))
+            init.ones_(module.D)
 
             dt_init_std = self.config.time_step_rank**-0.5 * self.config.time_step_scale
             if self.config.time_step_init_scheme == "constant":
-                nn.init.constant_(module.dt_proj.weight, dt_init_std)
+                init.constant_(module.dt_proj.weight, dt_init_std)
             elif self.config.time_step_init_scheme == "random":
-                nn.init.uniform_(module.dt_proj.weight, -dt_init_std, dt_init_std)
+                init.uniform_(module.dt_proj.weight, -dt_init_std, dt_init_std)
 
             dt = torch.exp(
                 torch.rand(self.config.intermediate_size)
@@ -406,14 +527,12 @@ class MambaPreTrainedModel(PreTrainedModel):
             ).clamp(min=self.config.time_step_floor)
             # # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
             inv_dt = dt + torch.log(-torch.expm1(-dt))
-            module.dt_proj.bias.copy_(inv_dt)
-            module.dt_proj.bias._no_reinit = True
+            init.copy_(module.dt_proj.bias, inv_dt)
 
-            nn.init.kaiming_uniform_(module.conv1d.weight, a=math.sqrt(5))
+            init.kaiming_uniform_(module.conv1d.weight, a=math.sqrt(5))
             if module.conv1d.bias is not None:
-                if not getattr(module.conv1d.bias, "_no_reinit", False):
-                    nn.init.zeros_(module.conv1d.bias)
-            nn.init.kaiming_uniform_(module.out_proj.weight, a=math.sqrt(5))
+                init.zeros_(module.conv1d.bias)
+            init.kaiming_uniform_(module.out_proj.weight, a=math.sqrt(5))
 
             if self.config.rescale_prenorm_residual:
                 # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
@@ -430,15 +549,13 @@ class MambaPreTrainedModel(PreTrainedModel):
                 p /= math.sqrt(self.config.num_hidden_layers)
 
         if isinstance(module, nn.Linear):
-            if not getattr(module.weight, "_no_reinit", False):
-                nn.init.normal_(module.weight, std=std)
+            init.normal_(module.weight, std=std)
             if module.bias is not None:
-                if not getattr(module.bias, "_no_reinit", False):
-                    nn.init.zeros_(module.bias)
+                init.zeros_(module.bias)
         elif isinstance(module, MambaRMSNorm):
-            module.weight.data.fill_(1.0)
+            init.ones_(module.weight)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, std=std)
+            init.normal_(module.weight, std=std)
 
 
 @dataclass
@@ -523,6 +640,7 @@ class MambaModel(MambaPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.LongTensor] = None,
+        **kwargs,
     ) -> Union[tuple, MambaOutput]:
         r"""
         cache_params (`MambaCache`, *optional*):
@@ -599,7 +717,7 @@ class MambaModel(MambaPreTrainedModel):
     """
 )
 class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "backbone.embeddings.weight"}
 
     def __init__(self, config):
         super().__init__(config)
@@ -607,12 +725,6 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         # Initialize weights and apply final processing
         self.post_init()
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
 
     def get_input_embeddings(self):
         return self.backbone.get_input_embeddings()
@@ -650,32 +762,26 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
         **kwargs,
     ):
         # Overwritten -- uses `cache_params` as opposed to `past_key_values`
-
-        if use_cache:
-            # `cache_position` should have been initialized in `generate`
-            if cache_position is None:
-                raise ValueError(
-                    "`cache_position` should not be None as it should have been initialized in "
-                    "`model.generate`, you are responsible for passing in a valid `cache_position` if "
-                    "you are calling `prepare_inputs_for_generation` directly with `use_cache=True`"
-                )
-            if cache_position[0] > 0:
-                input_ids = input_ids[:, -1].unsqueeze(-1)
-
-                if attention_mask is not None:
-                    attention_mask = None
-
+        model_inputs = {"input_ids": input_ids.contiguous()}
+        if use_cache and cache_params is None:
+            # we initialize the `cache_position` to full size of `conv_states` at prefill stage
+            # considering padding will be applied when input length is shorter, and truncation
+            # will be applied when it is longer, so it will be equivalent to always have it match
+            # the length of `cache_params.conv_states`, which is `config.conv_kernel`
+            cache_position = torch.arange(0, self.backbone.config.conv_kernel, device=input_ids.device)
+            if inputs_embeds is not None:
+                model_inputs = {"inputs_embeds": inputs_embeds}
+                max_batch_size = inputs_embeds.size(0)
             else:
-                # we initialize the `cache_position` to full size of `conv_states` at prefill stage
-                # considering padding will be applied when input length is shorter, and truncation
-                # will be applied when it is longer, so it will be equivalent to always have it match
-                # the length of `cache_params.conv_states`, which is `config.conv_kernel`
-                cache_position = torch.arange(0, self.config.conv_kernel, device=input_ids.device)
+                max_batch_size = input_ids.size(0)
+            cache_params = MambaCache(self.backbone.config, max_batch_size, device=self.device, dtype=self.dtype)
 
-        if inputs_embeds is not None and cache_params is None:
+        if use_cache and cache_position[0] > 0:
+            model_inputs["input_ids"] = input_ids[:, -1].unsqueeze(-1).contiguous()
+            attention_mask = None
+
+        if not use_cache and inputs_embeds is not None:
             model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids.contiguous()}
 
         model_inputs.update(
             {
@@ -685,6 +791,12 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
                 "attention_mask": attention_mask,
             }
         )
+
+        # Forward ALL kwargs that are uninitialized (e.g. `use_cache`).
+        for key, value in kwargs.items():
+            if key not in model_inputs:
+                model_inputs[key] = value
+
         return model_inputs
 
     @auto_docstring
@@ -699,6 +811,7 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,  # for now we need this for generation
     ) -> Union[tuple, MambaCausalLMOutput]:
         r"""
@@ -724,13 +837,15 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
             cache_position=cache_position,
             attention_mask=attention_mask,
         )
-        hidden_states = mamba_outputs[0]
 
-        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+        hidden_states = mamba_outputs[0]
+        # Only compute necessary logits
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :].to(self.lm_head.weight.dtype)).float()
 
         loss = None
         if labels is not None:
-            # move labels to correct device to enable model parallelism
+            # move labels to correct device
             labels = labels.to(logits.device)
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
@@ -751,4 +866,4 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
         )
 
 
-__all__ = ["MambaForCausalLM", "MambaModel", "MambaPreTrainedModel"]
+__all__ = ["MambaForCausalLM", "MambaModel", "MambaPreTrainedModel", "MambaCache"]

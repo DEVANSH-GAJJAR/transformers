@@ -15,6 +15,7 @@
 
 import math
 import unittest
+from functools import cached_property
 
 from transformers import HieraConfig
 from transformers.testing_utils import (
@@ -24,7 +25,6 @@ from transformers.testing_utils import (
     torch_device,
 )
 from transformers.utils import (
-    cached_property,
     is_torch_available,
     is_vision_available,
 )
@@ -243,11 +243,8 @@ class HieraModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
         if is_torch_available()
         else {}
     )
-    fx_compatible = True
 
-    test_pruning = False
     test_resize_embeddings = False
-    test_head_masking = False
     test_torch_exportable = True
 
     def setUp(self):
@@ -371,7 +368,7 @@ class HieraModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
                 [num_patches, self.model_tester.embed_dim],
             )
 
-            if not model_class.__name__ == "HieraBackbone":
+            if model_class.__name__ != "HieraBackbone":
                 reshaped_hidden_states = outputs.reshaped_hidden_states
                 self.assertEqual(len(reshaped_hidden_states), expected_num_layers)
 
@@ -527,12 +524,12 @@ def prepare_img():
 
 @require_torch
 @require_vision
+@slow
 class HieraModelIntegrationTest(unittest.TestCase):
     @cached_property
     def default_image_processor(self):
         return AutoImageProcessor.from_pretrained("facebook/hiera-tiny-224-in1k-hf") if is_vision_available() else None
 
-    @slow
     def test_inference_image_classification_head(self):
         model = HieraForImageClassification.from_pretrained("facebook/hiera-tiny-224-in1k-hf").to(torch_device)
 
@@ -586,7 +583,6 @@ class HieraModelIntegrationTest(unittest.TestCase):
 
         torch.testing.assert_close(outputs.last_hidden_state[0, :3, :3], expected_slice, rtol=1e-4, atol=1e-4)
 
-    @slow
     def test_inference_for_pretraining(self):
         # make random mask reproducible
         torch.manual_seed(2)

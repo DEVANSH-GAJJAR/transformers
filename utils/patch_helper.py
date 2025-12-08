@@ -64,9 +64,9 @@ def checkout_branch(branch):
     """Checkout the target branch."""
     try:
         subprocess.run(["git", "checkout", branch], check=True)
-        print(f"✅ Checked out branch: {branch}")
+        print(f"[SUCCESS] Checked out branch: {branch}")
     except subprocess.CalledProcessError:
-        print(f"❌ Failed to checkout branch: {branch}. Does it exist?")
+        print(f"[FAIL] Failed to checkout branch: {branch}. Does it exist?")
         exit(1)
 
 
@@ -85,7 +85,7 @@ def get_prs_by_label(label):
         "--limit",
         "100",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
     result.check_returncode()
     prs = json.loads(result.stdout)
     for pr in prs:
@@ -97,7 +97,9 @@ def get_prs_by_label(label):
 
 def get_commit_timestamp(commit_sha):
     """Get UNIX timestamp of a commit using git."""
-    result = subprocess.run(["git", "show", "-s", "--format=%ct", commit_sha], capture_output=True, text=True)
+    result = subprocess.run(
+        ["git", "show", "-s", "--format=%ct", commit_sha], check=False, capture_output=True, text=True
+    )
     result.check_returncode()
     return int(result.stdout.strip())
 
@@ -106,15 +108,16 @@ def cherry_pick_commit(sha):
     """Cherry-pick a given commit SHA."""
     try:
         subprocess.run(["git", "cherry-pick", sha], check=True)
-        print(f"✅ Cherry-picked commit {sha}")
+        print(f"[SUCCESS] Cherry-picked commit {sha}")
     except subprocess.CalledProcessError:
-        print(f"⚠️ Failed to cherry-pick {sha}. Manual intervention required.")
+        print(f"[WARNING] Failed to cherry-pick {sha}. Manual intervention required.")
 
 
 def commit_in_history(commit_sha, base_branch="HEAD"):
     """Return True if commit is already part of base_branch history."""
     result = subprocess.run(
         ["git", "merge-base", "--is-ancestor", commit_sha, base_branch],
+        check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -132,8 +135,8 @@ def main(verbose=False):
             pr["timestamp"] = get_commit_timestamp(sha)
         else:
             print("\n" + "=" * 80)
-            print(f"⚠️  WARNING: PR #{pr['number']} ({sha}) is NOT in main!")
-            print("⚠️  A core maintainer must review this before cherry-picking.")
+            print(f"[WARNING] PR #{pr['number']} ({sha}) is NOT in main!")
+            print("[WARNING] A core maintainer must review this before cherry-picking.")
             print("=" * 80 + "\n")
     # Sort by commit timestamp (ascending)
     prs = [pr for pr in prs if pr.get("timestamp") is not None]
@@ -143,9 +146,9 @@ def main(verbose=False):
         if sha:
             if commit_in_history(sha):
                 if verbose:
-                    print(f"🔁 PR #{pr['number']} ({pr['title']}) already in history. Skipping.")
+                    print(f"[INFO] PR #{pr['number']} ({pr['title']}) already in history. Skipping.")
             else:
-                print(f"🚀 PR #{pr['number']} ({pr['title']}) not in history. Cherry-picking...")
+                print(f"[INFO] PR #{pr['number']} ({pr['title']}) not in history. Cherry-picking...")
                 cherry_pick_commit(sha)
 
 

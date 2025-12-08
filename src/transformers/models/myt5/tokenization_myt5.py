@@ -20,7 +20,7 @@ import warnings
 from collections import defaultdict
 from typing import Optional, Union
 
-from ...tokenization_utils import AddedToken, PreTrainedTokenizer
+from ...tokenization_python import AddedToken, PreTrainedTokenizer
 from ...utils import logging
 
 
@@ -48,7 +48,7 @@ class ByteRewriter:
             with open(rewriting_rules, "r") as f:
                 rewriting_rules = json.load(f)
         elif not isinstance(rewriting_rules, dict):
-            raise ValueError(
+            raise TypeError(
                 f"rewriting_rules should be either a path to json file or a dict, got {type(rewriting_rules)}"
             )
 

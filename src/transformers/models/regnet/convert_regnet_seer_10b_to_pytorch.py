@@ -51,7 +51,7 @@ class Tracker:
     name2module: dict[str, nn.Module] = field(default_factory=OrderedDict)
 
     def _forward_hook(self, m, inputs: Tensor, outputs: Tensor, name: str):
-        has_not_submodules = len(list(m.modules())) == 1 or isinstance(m, nn.Conv2d) or isinstance(m, nn.BatchNorm2d)
+        has_not_submodules = len(list(m.modules())) == 1 or isinstance(m, (nn.Conv2d, nn.BatchNorm2d))
         if has_not_submodules:
             self.traced.append(m)
             self.name2module[name] = m
@@ -164,11 +164,9 @@ def convert_weights_and_push(save_directory: Path, model_name: Optional[str] = N
     num_labels = 1000
 
     repo_id = "huggingface/label-files"
-    num_labels = num_labels
     id2label = json.loads(Path(hf_hub_download(repo_id, filename, repo_type="dataset")).read_text())
     id2label = {int(k): v for k, v in id2label.items()}
 
-    id2label = id2label
     label2id = {v: k for k, v in id2label.items()}
 
     ImageNetPreTrainedConfig = partial(RegNetConfig, num_labels=num_labels, id2label=id2label, label2id=label2id)
@@ -217,7 +215,7 @@ def convert_weights_and_push(save_directory: Path, model_name: Optional[str] = N
         not_used_keys = list(from_state_dict.keys())
         regex = r"\.block.-part."
         # this is "interesting", so the original checkpoints have `block[0,1]-part` in each key name, we remove it
-        for key in from_state_dict.keys():
+        for key in from_state_dict:
             # remove the weird "block[0,1]-part" from the key
             src_key = re.sub(regex, "", key)
             # now src_key from the model checkpoints is the one we got from the original model after tracing, so use it to get the correct destination key
@@ -259,18 +257,12 @@ def convert_weights_and_push(save_directory: Path, model_name: Optional[str] = N
         )
         logger.info("Finally, pushing!")
         # push it to hub
-        our_model.push_to_hub(
-            repo_path_or_name=save_directory / model_name,
-            commit_message="Add model",
-            output_dir=save_directory / model_name,
-        )
+        our_model.push_to_hub(repo_id=model_name, commit_message="Add model", output_dir=save_directory / model_name)
         size = 384
         # we can use the convnext one
         image_processor = AutoImageProcessor.from_pretrained("facebook/convnext-base-224-22k-1k", size=size)
         image_processor.push_to_hub(
-            repo_path_or_name=save_directory / model_name,
-            commit_message="Add image processor",
-            output_dir=save_directory / model_name,
+            repo_id=model_name, commit_message="Add image processor", output_dir=save_directory / model_name
         )
 
 

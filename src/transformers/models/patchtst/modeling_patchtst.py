@@ -15,27 +15,29 @@
 """PyTorch PatchTST model."""
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 import torch
 from torch import nn
 
+from ... import initialization as init
 from ...activations import ACT2CLS
+from ...integrations.deepspeed import is_deepspeed_zero3_enabled
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_outputs import BaseModelOutput
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
 from ...time_series_utils import NegativeBinomialOutput, NormalOutput, StudentTOutput
-from ...utils import ModelOutput, auto_docstring, logging
-from ...utils.deprecation import deprecate_kwarg
+from ...utils import ModelOutput, TransformersKwargs, auto_docstring, logging
 from .configuration_patchtst import PatchTSTConfig
 
 
 logger = logging.get_logger(__name__)
 
 
-# Copied from transformers.models.bart.modeling_bart.eager_attention_forward
+# Copied from transformers.models.bert.modeling_bert.eager_attention_forward
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -44,22 +46,21 @@ def eager_attention_forward(
     attention_mask: Optional[torch.Tensor],
     scaling: Optional[float] = None,
     dropout: float = 0.0,
-    head_mask: Optional[torch.Tensor] = None,
-    **kwargs,
+    **kwargs: Unpack[TransformersKwargs],
 ):
     if scaling is None:
         scaling = query.size(-1) ** -0.5
 
+    # Take the dot product between "query" and "key" to get the raw attention scores.
     attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+
     if attention_mask is not None:
+        attention_mask = attention_mask[:, :, :, : key.shape[-2]]
         attn_weights = attn_weights + attention_mask
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
-    if head_mask is not None:
-        attn_weights = attn_weights * head_mask.view(1, -1, 1, 1)
-
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+
     attn_output = torch.matmul(attn_weights, value)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -101,13 +102,11 @@ class PatchTSTAttention(nn.Module):
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-    @deprecate_kwarg("past_key_value", version="4.54.0")
     def forward(
         self,
         hidden_states: torch.Tensor,
         key_value_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = False,
         # TODO: we need a refactor so that the different attention modules can get their specific kwargs
         # ATM, we have mixed things encoder, decoder, and encoder-decoder attn
@@ -146,7 +145,6 @@ class PatchTSTAttention(nn.Module):
             dropout=0.0 if not self.training else self.dropout,
             scaling=self.scaling,
             output_attentions=output_attentions,
-            head_mask=layer_head_mask,
             **kwargs,
         )
 
@@ -421,7 +419,7 @@ class PatchTSTEncoderLayer(nn.Module):
         super().__init__()
 
         self.channel_attention = config.channel_attention
-        # Multi-Head attention
+
         self.self_attn = PatchTSTAttention(
             embed_dim=config.d_model,
             num_heads=config.num_attention_heads,
@@ -556,29 +554,46 @@ class PatchTSTPreTrainedModel(PreTrainedModel):
     config: PatchTSTConfig
     base_model_prefix = "model"
     main_input_name = "past_values"
+    input_modalities = ("time",)
     supports_gradient_checkpointing = False
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _supports_flex_attn = True
 
-    def _init_weights(self, module):
+    @torch.no_grad()
+    def _init_weights(self, module: nn.Module):
         """
         Initialize weights
         """
         if isinstance(module, PatchTSTPositionalEncoding):
+            # get the number of patches
+            num_patches = (
+                max(self.config.context_length, self.config.patch_length) - self.config.patch_length
+            ) // self.config.patch_stride + 1
             # initialize cls_token
             if self.config.use_cls_token:
-                nn.init.normal_(module.cls_token, std=0.02)
+                init.normal_(module.cls_token, std=0.02)
+                num_patches += 1
             # initialize positional encoding
-            if self.config.positional_encoding_type == "random":
-                nn.init.normal_(module.position_enc, mean=0.0, std=0.1)
+            position_enc = module._init_pe(self.config, num_patches)
+            if is_deepspeed_zero3_enabled():
+                import deepspeed
+
+                with deepspeed.zero.GatheredParameters(module.position_enc, modifier_rank=None):
+                    if module.position_enc.numel() > 0:
+                        init.copy_(module.position_enc, position_enc)
+            else:
+                init.copy_(module.position_enc, position_enc)
         elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
+            init.zeros_(module.bias)
+            init.ones_(module.weight)
         elif isinstance(module, PatchTSTBatchNorm):
-            module.batchnorm.bias.data.zero_()
-            module.batchnorm.weight.data.fill_(1.0)
-        elif isinstance(module, (nn.Linear, nn.Conv1d)):
-            module.weight.data.normal_(mean=0.0, std=self.config.init_std)
+            init.zeros_(module.batchnorm.bias)
+            init.ones_(module.batchnorm.weight)
+        elif isinstance(module, nn.Linear):
+            init.normal_(module.weight, mean=0.0, std=self.config.init_std)
             if module.bias is not None:
-                module.bias.data.zero_()
+                init.zeros_(module.bias)
 
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, (PatchTSTEncoder)):
@@ -701,6 +716,7 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
         patch_input: torch.Tensor,
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
+        **kwargs,
     ) -> BaseModelOutput:
         """
         Parameters:
@@ -1089,6 +1105,7 @@ class PatchTSTModel(PatchTSTPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[tuple, PatchTSTModelOutput]:
         r"""
         Parameters:
@@ -1225,6 +1242,7 @@ class PatchTSTForPretraining(PatchTSTPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[tuple, PatchTSTForPretrainingOutput]:
         r"""
         Parameters:
@@ -1384,6 +1402,7 @@ class PatchTSTForClassification(PatchTSTPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[tuple, PatchTSTForClassificationOutput]:
         r"""
         past_values (`torch.Tensor` of shape `(bs, sequence_length, num_input_channels)`, *required*):
@@ -1591,6 +1610,7 @@ class PatchTSTForPrediction(PatchTSTPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[tuple, PatchTSTForPredictionOutput]:
         r"""
         Parameters:
@@ -1837,6 +1857,7 @@ class PatchTSTForRegression(PatchTSTPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[tuple, PatchTSTForRegressionOutput]:
         r"""
         past_values (`torch.Tensor` of shape `(bs, sequence_length, num_input_channels)`, *required*):
@@ -1882,7 +1903,7 @@ class PatchTSTForRegression(PatchTSTPreTrainedModel):
             if self.distribution_output:
                 distribution = self.distribution_output.distribution(y_hat)
                 # y_hat should be a 2-tuple, each with dimension [bs, num_targets]
-                y_hat = tuple([item.view(-1, self.config.num_targets) for item in y_hat])
+                y_hat = tuple(item.view(-1, self.config.num_targets) for item in y_hat)
                 loss = nll(distribution, target_values)
                 # take average of the loss
                 loss = weighted_average(loss)
